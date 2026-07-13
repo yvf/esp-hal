@@ -156,7 +156,17 @@ impl<'a> Ieee802154<'a> {
 
         if let Some(ext_addr) = cfg.ext_addr {
             let mut address = [0u8; IEEE802154_FRAME_EXT_ADDR_SIZE];
-            address.copy_from_slice(&ext_addr.to_le_bytes());
+            // [RCD PATCH] Was `to_le_bytes()`, which byte-REVERSED the HW address filter
+            // relative to the on-air frame order. The openthread esp platform reads the
+            // (little-endian) ext address with `u64::from_be_bytes` (platform.rs), so the
+            // first on-air octet ends up in the u64's MSB; `to_le_bytes` then puts it in
+            // the LAST filter byte instead of the first. Net effect: the HW ext-address
+            // filter never matched a unicast frame addressed to us, so every MLE Parent
+            // Response was FilterFail'd and OpenThread could never attach (only broadcast
+            // frames, which skip the ext-addr filter, were received). `to_be_bytes` writes
+            // the filter in on-air octet order so unicast-to-us frames match.
+            address.copy_from_slice(&ext_addr.to_be_bytes());
+            debug!("[154] ext-addr filter set to {:02x?}", address);
 
             set_extended_address(0, address);
         }

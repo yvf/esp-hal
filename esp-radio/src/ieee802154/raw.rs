@@ -9,7 +9,6 @@ use super::{
         FRAME_SIZE,
         FRAME_VERSION_1,
         FRAME_VERSION_2,
-        frame_get_version,
         frame_is_ack_required,
     },
     hal::*,
@@ -32,6 +31,11 @@ const PHY_ENABLE_VERSION_PRINT: u8 = 1;
 const ACK_TIMEOUT_US: u32 = 200_000;
 
 static mut RX_BUFFER: [u8; FRAME_SIZE] = [0u8; FRAME_SIZE];
+
+/// Buffer holding the software-generated enhanced-ACK frame. Length-prefixed
+/// like the TX buffer ([0] = PSDU length); the hardware transmits it from the
+/// TX DMA address after `enhack_generate_done_notify()`.
+static mut ENH_ACK_BUFFER: [u8; FRAME_SIZE] = [0u8; FRAME_SIZE];
 
 struct PendingTx {
     frame: *const u8,
@@ -152,6 +156,13 @@ fn ieee802154_mac_init(radio: IEEE802154<'_>) {
 
     set_ed_sample_mode(EdSampleMode::Avg);
 
+    // NOTE: ACK coex PTI left at the upstream default MIDDLE. An earlier RCD patch raised
+    // this to HIGH to win ACK arbitration against BLE, but that was for the *concurrent*
+    // (run_coex) commissioning model. This firmware now commissions NON-concurrently
+    // (BLE only while un-commissioned, radio is Thread-only once paired — see
+    // matter/stack.rs), so 802.15.4 never contends with BLE while it is ACKing Thread
+    // traffic; MIDDLE (= upstream) is sufficient and keeps the vendored diff to pure RX
+    // correctness fixes.
     unsafe { esp_coex_ieee802154_ack_pti_set(ieee802154_coex_event_t_IEEE802154_MIDDLE) };
     ieee802154_set_txrx_pti(Ieee802154TxRxScene::Idle);
 
@@ -172,6 +183,11 @@ fn ieee802154_set_txrx_pti(txrx_scene: Ieee802154TxRxScene) {
             unsafe { esp_coex_ieee802154_txrx_pti_set(ieee802154_coex_event_t_IEEE802154_IDLE) };
         }
         Ieee802154TxRxScene::Tx | Ieee802154TxRxScene::Rx => {
+            // Original upstream value. (An experiment raising this to IEEE802154_HIGH to
+            // fight an RX SfdTimeout flood turned out to be unnecessary once the real RX
+            // bugs were fixed — the ext-address filter byte order + abort-event re-arm —
+            // and HIGH starved concurrent BLE advertising/commissioning on the shared H2
+            // radio. Keep LOW so BLE↔802.15.4 coexistence during commissioning works.)
             unsafe { esp_coex_ieee802154_txrx_pti_set(ieee802154_coex_event_t_IEEE802154_LOW) };
         }
         Ieee802154TxRxScene::TxAt | Ieee802154TxRxScene::RxAt => {
@@ -279,6 +295,17 @@ fn rx_init(state: &mut IeeeState) {
 fn enable_rx() {
     set_next_rx_buffer();
     ieee802154_set_txrx_pti(Ieee802154TxRxScene::Rx);
+
+    // [RCD PATCH] Unmask ALL RX-abort events while receiving. At init only
+    // TxAckTimeout|TxAckCoexBreak are enabled, so an RX error while waiting for a
+    // frame (SfdTimeout/CrcError/InvalidLen/FilterFail/NoRss) aborts SILENTLY — no
+    // interrupt, so the ISR never runs and RX is never re-armed. The receiver then
+    // stays dead until the next TX happens to call enable_rx() again. With these
+    // events enabled, each abort fires the MAC interrupt and isr_handle_rx_phase_rx_abort
+    // sets needs_next_op → next_operation → enable_rx(), so RX continuously re-arms and
+    // a real incoming frame (the MLE parent response) can complete to RxDone. This is
+    // the proper mechanism the `ensure_receive_enabled()` poll-hack was crudely faking.
+    enable_rx_abort_events(RxAbortReason::all());
 
     set_cmd(Command::RxStart);
 
@@ -486,13 +513,14 @@ fn next_operation() {
 
 // FIXME: we shouldn't need this - we need to re-align the original driver with our port
 pub(crate) fn ensure_receive_enabled() {
-    // shouldn't be necessary but avoids a problem with rx stopping
-    // unexpectedly when used together with BLE
-    STATE.with(|state| {
-        if state.state == Ieee802154State::Receive {
-            set_cmd(Command::RxStart);
-        }
-    });
+    // [RCD PATCH] Do NOT re-issue RxStart here. This is polled from `raw_received()`
+    // on every receive poll; issuing `RxStart` again while a frame is mid-reception
+    // (after RxSfdDone, before RxDone) restarts the receiver and aborts the in-flight
+    // frame — observed on ESP32-H2 as endless RxSfdDone with rx_abort=SfdTimeout/RxStop
+    // and RxDone that never fires, so OpenThread never sees a parent response and stays
+    // Detached. The receiver is already armed by `enable_rx()`; leaving it alone lets
+    // reception complete. (Original hack was for an "rx stops unexpectedly with BLE"
+    // case — revisit if that recurs once BLE coexistence is back in play.)
 }
 
 #[handler(priority = Priority::Priority1)]
@@ -597,34 +625,76 @@ fn isr_handle_rx_done(needs_next_op: &mut bool) {
             crate::fmt::Bytes(&*core::ptr::addr_of!(RX_BUFFER))
         );
 
-        STATE.with(|state| {
-            let frm = if RX_BUFFER[0] >= FRAME_SIZE as u8 {
-                warn!("RX_BUFFER[0] {} is larger than frame size", RX_BUFFER[0]);
-                &RX_BUFFER[1..][..FRAME_SIZE - 1]
-            } else {
-                &RX_BUFFER[1..][..RX_BUFFER[0] as usize]
-            };
+        if RX_BUFFER[0] >= FRAME_SIZE as u8 {
+            warn!("RX_BUFFER[0] {} is larger than frame size", RX_BUFFER[0]);
+        }
 
+        STATE.with(|state| {
             // Always copy RX_BUFFER immediately — we only have one buffer,
             // and the hardware may overwrite it during auto-ACK or later RX.
             // The C driver can defer because it has multiple RX buffers and
             // advances the index in isr_handle_rx_done via next_rx_buffer().
             receive_done(state);
 
-            if will_auto_send_ack(frm) {
-                // auto tx ack for frame version 0b00 and 0b01
-                // Frame data already copied above. Defer rx_available()
-                // notification until ACK completes (isr_handle_ack_tx_done).
+            // [RCD PATCH] Deliver the frame to the upper layer IMMEDIATELY in all cases.
+            // The frame is already safely copied to the rx_queue by receive_done() above,
+            // so there's no buffer-reuse hazard. The original code deferred rx_available()
+            // for ACK-required frames until AckTxDone fired — but the ESP-IDF imm-ACK path
+            // does not reliably raise AckTxDone here, so those frames (e.g. a unicast MLE
+            // Parent Response) were copied but NEVER delivered to OpenThread, and the radio
+            // stayed stuck in TxAck. Notifying now guarantees delivery; the hardware still
+            // transmits the ACK independently of this notification.
+            super::rx_available();
+
+            // Decide what link-layer ACK the hardware must send.
+            //
+            // The 802.15.4 Frame Control Field is the first two PSDU octets. RX_BUFFER is
+            // length-prefixed, so [0] = PSDU length, [1] = FCF low, [2] = FCF high,
+            // [3] = sequence number. (The frame.rs frame_is_ack_required/frame_get_version
+            // helpers assume this length-prefixed layout — FRAME_AR_OFFSET=1,
+            // FRAME_VERSION_OFFSET=2 — so we read the fields directly here to avoid the
+            // off-by-one that resulted from passing them the un-prefixed PSDU.)
+            let len = RX_BUFFER[0] as usize;
+            let (ack_req, version, seq_suppressed, seq) = if len >= 3 {
+                let fcf_lo = RX_BUFFER[1];
+                let fcf_hi = RX_BUFFER[2];
+                (
+                    (fcf_lo & 0x20) != 0, // AR = FCF bit 5
+                    fcf_hi & 0x30,        // frame version = FCF bits 12..13
+                    (fcf_hi & 0x01) != 0, // sequence-number suppression = FCF bit 8
+                    RX_BUFFER[3],         // sequence number
+                )
+            } else {
+                (false, 0, true, 0)
+            };
+
+            if ack_req && version <= FRAME_VERSION_1 && tx_auto_ack() {
+                // Frame version 0b00/0b01: the hardware transmits an immediate ACK
+                // autonomously. Park in TxAck until AckTxDone re-arms RX.
                 state.state = Ieee802154State::TxAck;
                 *needs_next_op = false;
-            } else if should_send_enhanced_ack(frm) {
-                // Enhanced ACK for frame version 0b10 - TODO: full enh-ack support
-                // Frame data already copied above.
+            } else if ack_req && version == FRAME_VERSION_2 && tx_enhance_ack() && !seq_suppressed
+            {
+                // [RCD PATCH] Frame version 0b10 (802.15.4-2015): the hardware does NOT
+                // auto-ACK these; software must generate the enhanced ACK and hand it to
+                // the MAC. Thread 1.3 (Apple) links use version-2 data frames that REQUIRE
+                // an enhanced ACK — without one the parent marks the link failed,
+                // retransmits (the "Failed to process UDP: Duplicated" flood) and evicts
+                // the child, so operational CASE/SRP over Thread never completes.
+                //
+                // Build a minimal enhanced ACK (matched by sequence number; no addressing,
+                // no IEs, unsecured) and hand it to the hardware exactly as the ESP-IDF C
+                // driver does: point the TX DMA at it and strobe enhack_generate_done_notify,
+                // which makes the MAC transmit it in the ACK window. Completion raises
+                // AckTxDone (isr_handle_ack_tx_done → re-arm RX), the same path the imm-ACK
+                // above relies on.
+                build_enh_ack(seq);
+                set_tx_addr(core::ptr::addr_of!(ENH_ACK_BUFFER).cast());
+                enhack_generate_done_notify();
                 state.state = Ieee802154State::TxEnhAck;
                 *needs_next_op = false;
             } else {
-                // No ACK needed, notify immediately (data already copied above)
-                super::rx_available();
+                // No ACK required (broadcast, or sequence number suppressed): re-arm RX.
                 *needs_next_op = true;
             }
         });
@@ -633,9 +703,11 @@ fn isr_handle_rx_done(needs_next_op: &mut bool) {
 
 /// Handle ACK TX done in ISR - matches C driver's isr_handle_ack_tx_done
 fn isr_handle_ack_tx_done(needs_next_op: &mut bool) {
-    // Frame was already copied to queue in isr_handle_rx_done (we must copy
-    // immediately because we only have one RX buffer). Now notify upper layer.
-    super::rx_available();
+    // [RCD PATCH] Do NOT notify the upper layer here. isr_handle_rx_done now delivers the
+    // frame immediately via rx_available() for ALL frames (see the patch there), so a
+    // second rx_available() when the auto-ACK completes signals the same already-queued
+    // frame twice → OpenThread MLE logs "Failed to process UDP: Duplicated". Just advance
+    // to the next radio operation.
     *needs_next_op = true;
 }
 
@@ -803,12 +875,29 @@ fn freq_to_channel(freq: u8) -> u8 {
     (freq - 3) / 5 + 11
 }
 
-fn will_auto_send_ack(frame: &[u8]) -> bool {
-    frame_is_ack_required(frame) && frame_get_version(frame) <= FRAME_VERSION_1 && tx_auto_ack()
-}
-
-fn should_send_enhanced_ack(frame: &[u8]) -> bool {
-    frame_is_ack_required(frame) && frame_get_version(frame) <= FRAME_VERSION_2 && tx_enhance_ack()
+/// Build a minimal 802.15.4-2015 enhanced ACK into `ENH_ACK_BUFFER`.
+///
+/// Frame layout (length-prefixed for the TX DMA):
+///   [0] = 5  PSDU length: 2 (FCF) + 1 (seq) + 2 (FCS)
+///   [1] = 0x02, [2] = 0x20  FCF = 0x2002: frame type = Acknowledgement (0b010),
+///                           frame version = 0b10 (2015) in bits 12..13; no
+///                           addressing, no security, no IEs.
+///   [3] = seq  sequence number copied from the acknowledged frame (DSN match).
+///   [4],[5]    FCS placeholders — the hardware computes and writes the CRC.
+///
+/// The recipient matches the ACK by sequence number, exactly like the
+/// universally-accepted immediate ACK (which also carries no addressing). No IEs
+/// are needed for a non-sleepy (rx-on) child with CSL/link-metrics disabled, and
+/// OpenThread does not require the ACK to be secured in that case.
+fn build_enh_ack(seq: u8) {
+    unsafe {
+        ENH_ACK_BUFFER[0] = 5;
+        ENH_ACK_BUFFER[1] = 0x02;
+        ENH_ACK_BUFFER[2] = 0x20;
+        ENH_ACK_BUFFER[3] = seq;
+        ENH_ACK_BUFFER[4] = 0;
+        ENH_ACK_BUFFER[5] = 0;
+    }
 }
 
 /// Start the ACK receive timeout timer.

@@ -8,7 +8,9 @@ pub(crate) const FRAME_VERSION_2: u8 = 0x20; // IEEE 802.15.4 - 2015
 
 const FRAME_AR_OFFSET: usize = 1;
 const FRAME_AR_BIT: u8 = 0x20;
+#[allow(dead_code)]
 const FRAME_VERSION_OFFSET: usize = 2;
+#[allow(dead_code)]
 const FRAME_VERSION_MASK: u8 = 0x30;
 
 /// IEEE 802.15.4 MAC frame
@@ -62,6 +64,7 @@ pub(crate) fn frame_is_ack_required(frame: &[u8]) -> bool {
     (frame[FRAME_AR_OFFSET] & FRAME_AR_BIT) != 0
 }
 
+#[allow(dead_code)]
 pub(crate) fn frame_get_version(frame: &[u8]) -> u8 {
     if frame.len() <= FRAME_VERSION_OFFSET {
         return 0;
